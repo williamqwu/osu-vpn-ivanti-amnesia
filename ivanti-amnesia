@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""
+ivanti-amnesia - diagnose and recover Ivanti Secure Access when its embedded
+SAML login gets stuck on the Shibboleth "Unable to complete request / you waited
+an extended period of time" page.
+
+Safety model
+    * refuses to run as root
+    * only ever deletes paths on an explicit allowlist: entries under
+      ~/Library/{HTTPStorages,Caches,WebKit} whose path contains the app's
+      bundle id, plus keys in the app's own preference domain
+    * every byte it removes is copied into a timestamped backup first
+    * --dry-run prints the exact plan and changes nothing
+    * quits the app via AppleScript/SIGTERM only, never SIGKILL (a SIGKILL
+      during a cookie-jar flush is one of the ways this breaks in the first
+      place)
+    * cookie values are never printed - only length and a short digest
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import plistlib
+import shutil
+import signal
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+BUNDLE = "net.pulsesecure.Pulse-Secure"
+APP = Path("/Applications/Ivanti Secure Access.app")
+APP_BIN = APP / "Contents/MacOS/Ivanti Secure Access"
+HELPER_PATTERNS = ("Plugins/JamUI/WebLoginService.app", "Plugins/JamUI/cefBrowser")
+
+# Resolved: every target is compared and stored as a realpath, so HOME must be
+# one too, or a symlinked home directory breaks backup path arithmetic.
+HOME = Path(os.path.realpath(Path.home()))
+LIB = HOME / "Library"
+JAR = LIB / "HTTPStorages" / (BUNDLE + ".binarycookies")
+HTTP_DIR = LIB / "HTTPStorages" / BUNDLE
+CACHE_DIR = LIB / "Caches" / BUNDLE
+WEBKIT_DIR = LIB / "WebKit" / BUNDLE
+PREFS = LIB / "Preferences" / (BUNDLE + ".plist")
+
+STATE = LIB / "Application Support/ivanti-amnesia"
+BACKUPS = STATE / "backups"
+CAPTURES = STATE / "captures"
+
+# Cookies preserved by `fix --level session`: Duo remembered-device material.
+# Dropping these costs you an extra Duo approval on the next login.
+KEEP_DOMAIN_SUFFIXES = ("duosecurity.com",)
+
+# Preference keys that grow without bound, one per attempted SAML Single Logout.
+PRUNE_KEY_MARKERS = ("SAMLRequest=",)
+
+CAPTURE_WARNING = """\
+This directory contains UNREDACTED authentication material copied straight off
+the machine: the live cookie jar (session and SSO cookies, values in the clear),
+the app preferences, and the HTTP cache holding one-time SSO callback URLs.
+
+Anyone who gets a copy while these cookies are still valid may be able to resume
+your VPN and SSO session. Treat it exactly like a password.
+
+  * Do NOT attach it to a bug report, GitHub issue, ticket, chat or email.
+  * Do NOT put it in cloud storage or anywhere that syncs off the machine.
+  * Delete it once you are done:  rm -rf %s
+
+To share findings safely, quote the output of `ivanti-amnesia status` instead --
+that redacts every cookie value down to a length and an 8-character digest.
+"""
+
+MAC_EPOCH = 978307200.0
+COOKIE_MAGIC = b"cook"
+FOOTER_MAGIC = b"\x07\x17\x20\x05"
+PAGE_MAGIC = b"\x00\x00\x01\x00"
+
+BOLD, DIM, RED, YEL, GRN, OFF = "\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[0m"
+if not sys.stdout.isatty():
+    BOLD = DIM = RED = YEL = GRN = OFF = ""
+
+
+def die(msg, code=1):
+    print("%serror:%s %s" % (RED, OFF, msg), file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print("%swarning:%s %s" % (YEL, OFF, msg), file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# binarycookies codec
+#
+# Layout, verified byte-for-byte against this machine's jar (see selftest):
+#   'cook' | page_count(BE u32) | page_size[n](BE u32) | pages | checksum(BE u32)
+#   | 07 17 20 05 | meta_len(BE u32) | meta (binary plist)
+# page: 00 00 01 00 | cookie_count(LE u32) | cookie_offset[n](LE u32)
+#       | 00 00 00 00 | cookie records
+# The checksum is the sum of every 4th byte of every page.
+# --------------------------------------------------------------------------
+
+
+def jar_load(data):
+    """Return (pages, meta) where pages is a list of lists of raw cookie records."""
+    if data[:4] != COOKIE_MAGIC:
+        raise ValueError("not a binarycookies file")
+    n = struct.unpack(">I", data[4:8])[0]
+    if n > 100000:
+        raise ValueError("implausible page count %d" % n)
+    sizes = struct.unpack(">%dI" % n, data[8 : 8 + 4 * n])
+    off = 8 + 4 * n
+    pages = []
+    for size in sizes:
+        page = data[off : off + size]
+        off += size
+        if len(page) != size:
+            raise ValueError("truncated page")
+        if page[:4] != PAGE_MAGIC:
+            raise ValueError("bad page header %s" % page[:4].hex())
+        count = struct.unpack("<I", page[4:8])[0]
+        offsets = struct.unpack("<%dI" % count, page[8 : 8 + 4 * count])
+        records = []
+        for co in offsets:
+            length = struct.unpack("<I", page[co : co + 4])[0]
+            rec = page[co : co + length]
+            if len(rec) != length:
+                raise ValueError("truncated cookie record")
+            records.append(rec)
+        pages.append(records)
+    trailer = data[off:]
+    if len(trailer) < 12 or trailer[4:8] != FOOTER_MAGIC:
+        raise ValueError("bad trailer")
+    meta_len = struct.unpack(">I", trailer[8:12])[0]
+    meta = trailer[12:]
+    if len(meta) != meta_len:
+        raise ValueError("trailer length mismatch")
+    return pages, meta
+
+
+def _jar_page(records):
+    base = 8 + 4 * len(records) + 4
+    offsets, body = [], b""
+    for rec in records:
+        offsets.append(base + len(body))
+        body += rec
+    return (
+        PAGE_MAGIC
+        + struct.pack("<I", len(records))
+        + b"".join(struct.pack("<I", o) for o in offsets)
+        + b"\x00\x00\x00\x00"
+        + body
+    )
+
+
+def jar_dump(pages, meta):
+    blobs = [_jar_page(recs) for recs in pages if recs]
+    checksum = 0
+    for blob in blobs:
+        for i in range(0, len(blob), 4):
+            checksum += blob[i]
+    return (
+        COOKIE_MAGIC
+        + struct.pack(">I", len(blobs))
+        + b"".join(struct.pack(">I", len(b)) for b in blobs)
+        + b"".join(blobs)
+        + struct.pack(">I", checksum)
+        + FOOTER_MAGIC
+        + struct.pack(">I", len(meta))
+        + meta
+    )
+
+
+def cookie_fields(rec):
+    length = struct.unpack("<I", rec[0:4])[0]
+    flags = struct.unpack("<I", rec[8:12])[0]
+    d_off, n_off, p_off, v_off = struct.unpack("<4I", rec[16:32])
+    expires, created = struct.unpack("<dd", rec[40:56])
+
+    def text(off):
+        if not 0 < off < length:
+            return ""
+        end = rec.index(b"\x00", off)
+        return rec[off:end].decode("utf-8", "replace")
+
+    return {
+        "domain": text(d_off),
+        "name": text(n_off),
+        "path": text(p_off),
+        "value": text(v_off),
+        "expires": expires,
+        "created": created,
+        "secure": bool(flags & 1),
+        "httponly": bool(flags & 4),
+    }
+
+
+def jar_selftest(data):
+    """True if this file survives a parse/serialise round trip unchanged."""
+    try:
+        pages, meta = jar_load(data)
+        return jar_dump(pages, meta) == data
+    except Exception:
+        return False
+
+
+def keep_cookie(field):
+    domain = field["domain"].lstrip(".").lower()
+    return any(domain == s or domain.endswith("." + s) for s in KEEP_DOMAIN_SUFFIXES)
+
+
+def redact(value):
+    if not value:
+        return "len=0"
+    digest = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
+    return "len=%d %s" % (len(value), digest)
+
+
+def shell_quote(path):
+    """A copy-pasteable path: $HOME-relative and quoted, since it contains spaces."""
+    return '"%s"' % str(path).replace(str(HOME), "$HOME")
+
+
+def mac_time(value):
+    if not value:
+        return "session"
+    try:
+        return dt.datetime.fromtimestamp(value + MAC_EPOCH).strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, OSError):
+        return "?"
+
+
+# --------------------------------------------------------------------------
+# path safety
+# --------------------------------------------------------------------------
+
+FORBIDDEN_PARTS = {"Safari", "com.apple.Safari", "Keychains", "Containers"}
+
+
+def safe_target(path):
+    """Resolve `path` and refuse anything outside the allowlist."""
+    real = Path(os.path.realpath(path))
+    lib = Path(os.path.realpath(LIB))
+    if not str(real).startswith(str(lib) + os.sep):
+        die("refusing to touch %s (outside %s)" % (real, lib))
+    if not any(BUNDLE in part for part in real.parts):
+        die("refusing to touch %s (not an Ivanti path)" % real)
+    bad = FORBIDDEN_PARTS.intersection(real.parts)
+    if bad:
+        die("refusing to touch %s (contains %s)" % (real, ", ".join(sorted(bad))))
+    return real
+
+
+def dir_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda e: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def human(size):
+    for unit in ("B", "K", "M", "G"):
+        if size < 1024 or unit == "G":
+            return "%.0f%s" % (size, unit) if unit != "B" else "%dB" % size
+        size /= 1024.0
+
+
+# --------------------------------------------------------------------------
+# process control
+# --------------------------------------------------------------------------
+
+
+OWN_PROCESS_NAMES = ("Ivanti Secure Access", "WebLoginService", "cefBrowser")
+
+
+def is_ours(pid):
+    """pgrep -f matches command lines; confirm the executable before signalling."""
+    try:
+        comm = subprocess.run(
+            ["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return comm.startswith(str(APP)) and any(n in comm for n in OWN_PROCESS_NAMES)
+
+
+def pids_for(pattern):
+    try:
+        out = subprocess.run(
+            ["pgrep", "-u", str(os.getuid()), "-f", pattern],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(p) for p in out.split()
+            if p.isdigit() and int(p) != os.getpid() and is_ours(int(p))]
+
+
+def app_pids():
+    found = list(pids_for(str(APP_BIN)))
+    for pattern in HELPER_PATTERNS:
+        for pid in pids_for(pattern):
+            if pid not in found:
+                found.append(pid)
+    return found
+
+
+def pid_started(pid):
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+        return out or "?"
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+
+
+def pid_elapsed(pid):
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+        return out or "?"
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+
+
+def quit_app(dry):
+    pids = app_pids()
+    if not pids:
+        print("  app is not running")
+        return True
+    print("  quitting Ivanti Secure Access (pids %s)" % ", ".join(map(str, pids)))
+    if dry:
+        print("  %s[dry-run]%s would send 'quit', then SIGTERM if needed" % (DIM, OFF))
+        return True
+    subprocess.run(
+        ["osascript", "-e", 'tell application "Ivanti Secure Access" to quit'],
+        capture_output=True, timeout=30,
+    )
+    for _ in range(20):
+        if not app_pids():
+            print("  %sapp exited cleanly%s" % (GRN, OFF))
+            return True
+        time.sleep(0.5)
+    for pid in app_pids():
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(20):
+        if not app_pids():
+            print("  %sapp exited after SIGTERM%s" % (GRN, OFF))
+            return True
+        time.sleep(0.5)
+    # Deliberately no SIGKILL: killing mid-flush is what leaves torn cookie jars.
+    return False
+
+
+def launch_app(dry):
+    if dry:
+        print("  %s[dry-run]%s would relaunch %s" % (DIM, OFF, APP.name))
+        return
+    subprocess.run(["open", "-a", str(APP)], capture_output=True, timeout=30)
+    print("  relaunched %s" % APP.name)
+
+
+def gateway_hosts():
+    """Gateway hostnames the client knows about, from cookies and window prefs."""
+    hosts = set()
+    try:
+        pages, _ = jar_load(JAR.read_bytes())
+        for recs in pages:
+            for rec in recs:
+                field = cookie_fields(rec)
+                domain = field["domain"].lstrip(".")
+                if (domain.startswith("vpn.")
+                        or "/dana-na/" in field["path"]
+                        or field["name"].startswith("DS")):
+                    hosts.add(domain)
+    except Exception:
+        pass
+    return sorted(hosts)
+
+
+def tunnel_established(hosts):
+    """Best-effort: is there a live TCP session to a known gateway on :443?"""
+    if not hosts:
+        return []
+    addrs = set()
+    for host in hosts:
+        try:
+            out = subprocess.run(
+                ["dscacheutil", "-q", "host", "-a", "name", host],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.splitlines():
+            if line.startswith("ip_address:"):
+                addrs.add(line.split(":", 1)[1].strip())
+    if not addrs:
+        return []
+    try:
+        net = subprocess.run(
+            ["netstat", "-an", "-p", "tcp"], capture_output=True, text=True, timeout=20
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    live = []
+    for line in net.splitlines():
+        if "ESTABLISHED" not in line:
+            continue
+        for addr in addrs:
+            if ("%s.443" % addr) in line:
+                live.append(addr)
+    return sorted(set(live))
+
+
+def private_relay_active():
+    """Best effort. Returns True/False/None(unknown)."""
+    try:
+        raw = subprocess.run(
+            ["defaults", "export", "com.apple.networkserviceproxy", "-"],
+            capture_output=True, timeout=10,
+        ).stdout
+        blob = plistlib.loads(raw).get("NSPServiceStatusManagerInfo")
+        if not isinstance(blob, (bytes, bytearray)):
+            return None
+        inner = plistlib.loads(bytes(blob))
+        for obj in inner.get("$objects", []):
+            if isinstance(obj, dict) and "PrivacyProxyServiceStatus" in obj:
+                return bool(obj["PrivacyProxyServiceStatus"])
+    except Exception:
+        return None
+    return None
+
+
+# --------------------------------------------------------------------------
+# preferences
+# --------------------------------------------------------------------------
+
+
+def prefs_export():
+    try:
+        raw = subprocess.run(
+            ["defaults", "export", BUNDLE, "-"], capture_output=True, timeout=30
+        ).stdout
+        return plistlib.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def prunable_pref_keys(prefs):
+    return sorted(
+        k for k in prefs
+        if k.startswith("NSWindow Frame ") and any(m in k for m in PRUNE_KEY_MARKERS)
+    )
+
+
+# --------------------------------------------------------------------------
+# cache inspection
+# --------------------------------------------------------------------------
+
+
+def cache_stats():
+    db = CACHE_DIR / "Cache.db"
+    if not db.exists():
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(db) + suffix)
+            if src.exists():
+                try:
+                    shutil.copy2(src, Path(tmp) / src.name)
+                except OSError:
+                    pass
+        copy = Path(tmp) / db.name
+        if not copy.exists():
+            return None
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % copy, uri=True)
+            cur = con.cursor()
+            total = cur.execute("select count(*) from cfurl_cache_response").fetchone()[0]
+            oldest, newest = cur.execute(
+                "select min(time_stamp), max(time_stamp) from cfurl_cache_response"
+            ).fetchone()
+            onetime = cur.execute(
+                "select count(*) from cfurl_cache_response "
+                "where request_key like '%duo-callback%' or request_key like '%SAMLResponse%' "
+                "or request_key like '%code=%'"
+            ).fetchone()[0]
+            con.close()
+            return {"total": total, "oldest": oldest, "newest": newest, "onetime": onetime}
+        except sqlite3.Error:
+            return None
+
+
+# --------------------------------------------------------------------------
+# mutation runner
+# --------------------------------------------------------------------------
+
+
+class Runner:
+    def __init__(self, dry, backup_root):
+        self.dry = dry
+        self.root = backup_root
+        self.manifest = []
+
+    def _stash(self, path):
+        """Copy `path` into the backup tree, preserving its location under $HOME."""
+        if self.dry:
+            return None
+        try:
+            rel = path.relative_to(HOME)
+        except ValueError:
+            die("cannot back up %s: it is outside %s" % (path, HOME))
+        dest = self.root / "files" / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_dir():
+            shutil.copytree(path, dest, dirs_exist_ok=True, symlinks=True)
+        else:
+            shutil.copy2(path, dest)
+            os.chmod(dest, 0o600)  # same live cookies as the original
+        self.manifest.append({"kind": "file", "path": str(rel)})
+        return dest
+
+    def remove(self, path, why):
+        path = Path(path)
+        if not path.exists():
+            return
+        real = safe_target(path)
+        size = dir_size(real) if real.is_dir() else real.stat().st_size
+        print("  remove  %-58s %6s  %s" % (str(real).replace(str(HOME), "~"), human(size), why))
+        if self.dry:
+            return
+        self._stash(real)
+        if real.is_dir():
+            shutil.rmtree(real)
+        else:
+            real.unlink()
+
+    def clear_dir(self, path, why):
+        path = Path(path)
+        if not path.is_dir():
+            return
+        real = safe_target(path)
+        entries = sorted(real.iterdir())
+        if not entries:
+            return
+        size = dir_size(real)
+        print("  clear   %-58s %6s  %s" % (str(real).replace(str(HOME), "~") + "/*", human(size), why))
+        if self.dry:
+            return
+        self._stash(real)
+        for entry in entries:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+    def write(self, path, data, why):
+        real = safe_target(path)
+        print("  rewrite %-58s %6s  %s" % (str(real).replace(str(HOME), "~"), human(len(data)), why))
+        if self.dry:
+            return
+        self._stash(real)
+        tmp = real.with_name(real.name + ".ivanti-amnesia.tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        shutil.copystat(real, tmp)
+        os.replace(tmp, real)
+
+    def prune_prefs(self, keys):
+        if not keys:
+            return
+        print("  prefs   delete %d stale SAML-logout window key(s) from %s" % (len(keys), BUNDLE))
+        if self.dry:
+            return
+        for key in keys:
+            subprocess.run(["defaults", "delete", BUNDLE, key], capture_output=True, timeout=30)
+        self.manifest.append({"kind": "prefs", "domain": BUNDLE, "deleted": keys})
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def cmd_status(args):
+    print("%sIvanti Secure Access - login state%s" % (BOLD, OFF))
+    version = "?"
+    info = APP / "Contents/Info.plist"
+    if info.exists():
+        try:
+            version = plistlib.loads(info.read_bytes()).get("CFBundleShortVersionString", "?")
+        except Exception:
+            pass
+    print("  app          %s  (%s)" % (version, APP if APP.exists() else "NOT INSTALLED"))
+
+    pids = app_pids()
+    if pids:
+        main = pids[0]
+        print("  process      running, pid %d, up %s (since %s)" % (main, pid_elapsed(main), pid_started(main)))
+        print("               %sthe embedded browser's in-memory session cookies live in this process%s" % (DIM, OFF))
+    else:
+        print("  process      not running  %s(in-memory session cookies are already gone)%s" % (DIM, OFF))
+
+    hosts = gateway_hosts()
+    live = tunnel_established(hosts)
+    print("  gateway      %s" % (", ".join(hosts) if hosts else "unknown"))
+    print("  tunnel       %s" % ("CONNECTED (%s:443)" % live[0] if live else "no live session"))
+
+    relay = private_relay_active()
+    print("  iCloud Relay %s" % {True: "ON - turn it off, it breaks the OSU login", False: "off", None: "unknown"}[relay])
+
+    print()
+    print("%sPersistent web state%s" % (BOLD, OFF))
+    flags = []
+    if JAR.exists():
+        data = JAR.read_bytes()
+        ok = jar_selftest(data)
+        mtime = dt.datetime.fromtimestamp(JAR.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        print("  cookie jar   %s  (%s, last written %s, round-trip %s)"
+              % (JAR.name, human(len(data)), mtime, "ok" if ok else "FAILED"))
+        if not ok:
+            flags.append("cookie jar does not round-trip; `fix --level session` will refuse, use --level full")
+        try:
+            pages, _ = jar_load(data)
+        except Exception as exc:
+            print("               unreadable: %s" % exc)
+            pages = []
+        rows = []
+        for recs in pages:
+            for rec in recs:
+                field = cookie_fields(rec)
+                rows.append((field["domain"], field["name"], field, keep_cookie(field)))
+        for domain, name, field, kept in sorted(rows):
+            print("    %-4s %-31s %-46s %s  %s -> %s"
+                  % ("keep" if kept else "%sdrop%s" % (YEL, OFF),
+                     domain, name[:46], redact(field["value"]),
+                     mac_time(field["created"]), mac_time(field["expires"])))
+        print("               %skeep/drop shown for `fix --level session`; --level full drops all%s" % (DIM, OFF))
+    else:
+        print("  cookie jar   absent")
+
+    orphans = sorted(JAR.parent.glob(BUNDLE + ".binarycookies_tmp_*.dat"))
+    if orphans:
+        for path in orphans:
+            age = (time.time() - path.stat().st_mtime) / 86400.0
+            print("  %sorphan jar%s   %s  (%s, %.0f days old)" % (YEL, OFF, path.name, human(path.stat().st_size), age))
+        flags.append("%d orphaned cookie-jar temp file(s): the app was hard-killed mid-write at least once"
+                     % len(orphans))
+
+    stats = cache_stats()
+    if stats:
+        print("  http cache   %d responses (%s), %s .. %s"
+              % (stats["total"], human(dir_size(CACHE_DIR)), stats["oldest"], stats["newest"]))
+        if stats["onetime"]:
+            print("               %s%d cached single-use SSO callback URL(s) (duo-callback / code=)%s"
+                  % (YEL, stats["onetime"], OFF))
+            flags.append("%d one-time SSO callbacks sitting in the on-disk cache" % stats["onetime"])
+    elif CACHE_DIR.exists():
+        print("  http cache   %s" % human(dir_size(CACHE_DIR)))
+
+    if WEBKIT_DIR.exists():
+        print("  webkit data  %s" % human(dir_size(WEBKIT_DIR)))
+
+    stale_keys = prunable_pref_keys(prefs_export())
+    if stale_keys:
+        print("  prefs        %d saved SAML-logout window key(s)" % len(stale_keys))
+        flags.append("%d accumulated SAML Single-Logout window keys: sign-out has been failing" % len(stale_keys))
+
+    print()
+    if flags:
+        print("%sFindings%s" % (BOLD, OFF))
+        for flag in flags:
+            print("  - %s" % flag)
+        print()
+    if live:
+        print("You are connected. Nothing to do - run `fix` only when a login is stuck.")
+    else:
+        print("If a login is stuck, run: %sivanti-amnesia fix%s   (add --dry-run to preview)" % (BOLD, OFF))
+    return 0
+
+
+def cmd_fix(args):
+    if not APP.exists():
+        die("Ivanti Secure Access is not installed at %s" % APP)
+
+    hosts = gateway_hosts()
+    live = tunnel_established(hosts)
+    if live and not args.force:
+        die("the VPN is currently connected (%s:443).\n"
+            "       Disconnect in the Ivanti window first, then re-run.\n"
+            "       Use --force to proceed anyway (this will not tear down the tunnel)." % live[0])
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    root = BACKUPS / stamp
+    if not args.dry_run:
+        root.mkdir(parents=True, exist_ok=True)
+        os.chmod(BACKUPS, 0o700)
+        os.chmod(root, 0o700)
+
+    print("%sivanti-amnesia fix --level %s%s%s" % (BOLD, args.level, "  [dry run]" if args.dry_run else "", OFF))
+    print("  backup  %s" % (str(root).replace(str(HOME), "~") if not args.dry_run else "(none - dry run)"))
+    print()
+
+    print("%s1. stop the app%s  (its process holds the in-memory SSO session cookies)" % (BOLD, OFF))
+    if args.no_quit:
+        print("  skipped (--no-quit)")
+    elif not quit_app(args.dry_run):
+        die("could not stop Ivanti Secure Access cleanly. Quit it from the menu bar and re-run.\n"
+            "       (This tool never sends SIGKILL: a hard kill mid-flush is one cause of the bug.)")
+    print()
+
+    runner = Runner(args.dry_run, root)
+
+    if not args.dry_run:
+        prefs = prefs_export()
+        if prefs:
+            with open(root / "prefs.plist", "wb") as fh:
+                plistlib.dump(prefs, fh)
+
+    print("%s2. clear the stale web state%s" % (BOLD, OFF))
+
+    if args.level == "session" and JAR.exists():
+        data = JAR.read_bytes()
+        if not jar_selftest(data):
+            die("this cookie jar does not survive a round trip, so surgical editing is unsafe.\n"
+                "       Re-run with --level full (you will need one extra Duo approval).")
+        pages, meta = jar_load(data)
+        kept, dropped = [], 0
+        for recs in pages:
+            page = []
+            for rec in recs:
+                if keep_cookie(cookie_fields(rec)):
+                    page.append(rec)
+                else:
+                    dropped += 1
+            kept.append(page)
+        kept = [p for p in kept if p]
+        if not kept:
+            runner.remove(JAR, "no cookies worth keeping")
+        elif dropped == 0:
+            print("  keep    cookie jar unchanged (only Duo device-trust cookies present)")
+        else:
+            new = jar_dump(kept, meta)
+            check, _ = jar_load(new)
+            if sum(len(p) for p in check) != sum(len(p) for p in kept):
+                die("internal check failed while rebuilding the cookie jar; nothing was changed")
+            runner.write(JAR, new, "dropped %d SSO cookie(s), kept %d Duo cookie(s)"
+                         % (dropped, sum(len(p) for p in kept)))
+    elif JAR.exists():
+        runner.remove(JAR, "all cookies incl. Duo device trust")
+
+    for orphan in sorted(JAR.parent.glob(BUNDLE + ".binarycookies_tmp_*.dat")):
+        runner.remove(orphan, "orphaned jar from an interrupted write")
+
+    runner.clear_dir(CACHE_DIR, "cached SSO responses and one-time callback URLs")
+
+    if args.level == "full":
+        runner.clear_dir(HTTP_DIR, "alt-svc / HTTP storage")
+        runner.clear_dir(WEBKIT_DIR / "WebsiteData", "WebKit local storage")
+
+    runner.prune_prefs(prunable_pref_keys(prefs_export()))
+    print()
+
+    if not args.dry_run:
+        with open(root / "manifest.json", "w") as fh:
+            json.dump({"version": 1, "level": args.level, "created": stamp,
+                       "items": runner.manifest}, fh, indent=2)
+
+    print("%s3. restart%s" % (BOLD, OFF))
+    if args.no_relaunch:
+        print("  skipped (--no-relaunch)")
+    else:
+        launch_app(args.dry_run)
+    print()
+
+    if args.dry_run:
+        print("Dry run - nothing was changed. Drop --dry-run to apply.")
+    else:
+        print("%sDone.%s Connect again; you should get a fresh login page." % (GRN, OFF))
+        print("Undo with: %sivanti-amnesia restore %s%s" % (BOLD, stamp, OFF))
+    return 0
+
+
+def cmd_capture(args):
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    root = CAPTURES / stamp
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(CAPTURES, 0o700)
+    os.chmod(root, 0o700)
+
+    for src in (JAR, PREFS):
+        if src.exists():
+            shutil.copy2(src, root / src.name)
+    for orphan in sorted(JAR.parent.glob(BUNDLE + ".binarycookies_tmp_*.dat")):
+        shutil.copy2(orphan, root / orphan.name)
+    for suffix in ("", "-wal", "-shm"):
+        src = Path(str(CACHE_DIR / "Cache.db") + suffix)
+        if src.exists():
+            shutil.copy2(src, root / src.name)
+
+    try:
+        logs = subprocess.run(
+            ["log", "show", "--style", "compact", "--last", args.since,
+             "--predicate",
+             'process CONTAINS "Pulse" OR process CONTAINS "Ivanti" OR process == "WebLoginService"'],
+            capture_output=True, text=True, timeout=180,
+        ).stdout
+        (root / "unified-log.txt").write_text(logs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        (root / "unified-log.txt").write_text("log capture failed: %s\n" % exc)
+
+    os.chmod(root, 0o700)
+    for item in root.iterdir():
+        if item.is_file():
+            os.chmod(item, 0o600)
+
+    # The warning travels with the bundle: whoever opens a copy of this directory
+    # should see it even if they never saw the terminal output.
+    (root / "READ-ME-FIRST.txt").write_text(CAPTURE_WARNING % shell_quote(root))
+    os.chmod(root / "READ-ME-FIRST.txt", 0o600)
+
+    print("Captured to %s" % str(root).replace(str(HOME), "~"))
+    print()
+    print("%s%s%s" % (YEL, (CAPTURE_WARNING % shell_quote(root)).strip(), OFF))
+    return 0
+
+
+def cmd_backups(args):
+    if not BACKUPS.is_dir():
+        print("no backups yet")
+        return 0
+    entries = sorted(p for p in BACKUPS.iterdir() if p.is_dir())
+    if not entries:
+        print("no backups yet")
+        return 0
+    for path in entries:
+        level = "?"
+        manifest = path / "manifest.json"
+        if manifest.exists():
+            try:
+                level = json.loads(manifest.read_text()).get("level", "?")
+            except ValueError:
+                pass
+        print("  %s  level=%-8s %6s  %s" % (path.name, level, human(dir_size(path)), path))
+    return 0
+
+
+def cmd_restore(args):
+    if not BACKUPS.is_dir():
+        die("no backups exist")
+    entries = sorted(p for p in BACKUPS.iterdir() if p.is_dir())
+    if not entries:
+        die("no backups exist")
+    if args.stamp in ("latest", "last"):
+        root = entries[-1]
+    else:
+        root = BACKUPS / args.stamp
+        if not root.is_dir():
+            die("no such backup: %s (try `ivanti-amnesia backups`)" % args.stamp)
+
+    if app_pids():
+        die("quit Ivanti Secure Access first, then re-run")
+
+    print("%srestoring %s%s" % (BOLD, root.name, OFF))
+    files_root = root / "files"
+    if files_root.is_dir():
+        for src in sorted(files_root.rglob("*")):
+            if src.is_dir():
+                continue
+            dest = HOME / src.relative_to(files_root)
+            safe_target(dest)
+            print("  restore %s" % str(dest).replace(str(HOME), "~"))
+            if not args.dry_run:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+    prefs_backup = root / "prefs.plist"
+    if prefs_backup.exists():
+        print("  restore preferences for %s" % BUNDLE)
+        if not args.dry_run:
+            subprocess.run(["defaults", "import", BUNDLE, str(prefs_backup)],
+                           capture_output=True, timeout=30)
+    print()
+    print("Dry run - nothing changed." if args.dry_run else "%sRestored.%s" % (GRN, OFF))
+    return 0
+
+
+def cmd_selftest(args):
+    """Verify the codec against whatever jars exist on this machine."""
+    targets = [JAR] + sorted(JAR.parent.glob(BUNDLE + ".binarycookies_tmp_*.dat"))
+    targets += sorted((CAPTURES).rglob("*.binarycookies*")) if CAPTURES.is_dir() else []
+    found = 0
+    failed = 0
+    for path in targets:
+        if not path.exists():
+            continue
+        found += 1
+        data = path.read_bytes()
+        ok = jar_selftest(data)
+        failed += 0 if ok else 1
+        print("  %-6s %s (%s)" % ("ok" if ok else "FAIL", path.name, human(len(data))))
+    if not found:
+        print("  no cookie jars on this machine to test against")
+        return 0
+    print("%d/%d round-tripped byte-for-byte" % (found - failed, found))
+    return 1 if failed else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="ivanti-amnesia",
+        description="Diagnose and recover a stuck Ivanti Secure Access SAML login.",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("status", help="read-only report on the current login state")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("fix", help="clear the stale SSO state and restart the app")
+    p.add_argument("--level", choices=("session", "full"), default="session",
+                   help="session (default): drop SSO cookies, keep Duo device trust. "
+                        "full: drop everything, costs one extra Duo approval")
+    p.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
+    p.add_argument("--force", action="store_true", help="run even while the VPN is connected")
+    p.add_argument("--no-quit", action="store_true", help="do not stop the app first")
+    p.add_argument("--no-relaunch", action="store_true", help="do not reopen the app afterwards")
+    p.set_defaults(func=cmd_fix)
+
+    p = sub.add_parser("capture",
+                       help="snapshot state + logs while the failure is on screen "
+                            "(WARNING: writes unredacted live cookies to disk)")
+    p.add_argument("--since", default="30m", help="how far back to pull the unified log (default 30m)")
+    p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("backups", help="list backups taken by `fix`")
+    p.set_defaults(func=cmd_backups)
+
+    p = sub.add_parser("restore", help="undo a `fix` from its backup")
+    p.add_argument("stamp", nargs="?", default="latest", help="backup id, or 'latest'")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("selftest", help="verify the cookie-jar codec round-trips")
+    p.set_defaults(func=cmd_selftest)
+
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        args = parser.parse_args(["status"])
+
+    if sys.platform != "darwin":
+        die("macOS only")
+    if os.geteuid() == 0:
+        die("refusing to run as root - this only touches your own ~/Library")
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
